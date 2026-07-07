@@ -4,28 +4,24 @@ import { getSupabase, isSupabaseConfigured } from "@/lib/supabase";
 import { Charge, ScraperRunStatus } from "@/lib/types";
 
 /**
- * Authorized importer for a friend site (palmbeachandbrowardmugshots.com).
+ * Authorized importer for a friend site (palmbeachandbrowardmugshots.com),
+ * used with the site owner's explicit permission.
  *
- * The owner of the target site has given explicit permission to import
- * records. Even so, this adapter behaves like the official scraper:
- *  - It only runs when FRIEND_SITE_ALLOWED === "true" (an explicit
- *    authorization gate the operator sets after confirming permission).
- *  - Honest, identifiable User-Agent (FRIEND_SITE_USER_AGENT).
- *  - Delay between requests (FRIEND_SITE_DELAY_MS) and a hard record cap
- *    (FRIEND_SITE_MAX_RECORDS).
- *  - Stops politely with status "blocked" on 401/403/429/503 or a
- *    CAPTCHA / anti-bot challenge page — no bypassing.
- *  - Dry-run mode writes nothing.
- *  - suppression_list is checked before every insert; hidden records are
- *    never resurrected; dedupe keeps daily runs idempotent.
- *  - Mugshot URLs are stored only when visible in public HTML. Images are
- *    never downloaded, uploaded, or displayed (display is separately gated
- *    by NEXT_PUBLIC_DISPLAY_MUGSHOTS, which stays false).
+ * The target is a WordPress site: booking records are posts, dates come
+ * from post/published metadata when not labelled in the body, and photos
+ * are WordPress featured images (wp-content/uploads). The parser is built
+ * for those conventions.
  *
- * The target site covers both Palm Beach and Broward counties. The importer
- * parses and reports both, but by default only Broward records are eligible
- * for a live write (this project is Broward-focused); Palm Beach and
- * Unknown-county records are reported for review and skipped on live import.
+ * Safety model (unchanged):
+ *  - Runs only when FRIEND_SITE_ALLOWED === "true" (authorization gate).
+ *  - Honest UA, delay between requests, hard record cap.
+ *  - Stops with status "blocked" on 401/403/429/503 or CAPTCHA/anti-bot
+ *    pages — no bypassing, no proxies.
+ *  - Dry-run writes nothing; suppression checked before every write.
+ *  - Mugshot URLs are stored only — never downloaded, uploaded, or
+ *    displayed (display gated separately by NEXT_PUBLIC_DISPLAY_MUGSHOTS).
+ *
+ * Both Broward and Palm Beach records are parsed and eligible for import.
  */
 
 export const FRIEND_SOURCE = "palmbeachandbrowardmugshots";
@@ -34,6 +30,7 @@ export type County = "Broward" | "Palm Beach" | "Unknown";
 
 export interface FriendImportOptions {
   dryRun: boolean;
+  debug?: boolean;
   log?: (line: string) => void;
 }
 
@@ -55,8 +52,9 @@ export interface FriendRecord {
   charges_text: string;
   bond_json: { total_bond?: string | null } | null;
   mugshot_url: string | null;
-  official_detail_url: string; // friend-site detail page URL (stored in official_detail_url)
+  official_detail_url: string;
   status: "pending";
+  date_source: string | null;
   dedup_key: string;
 }
 
@@ -65,7 +63,18 @@ export interface SkippedPage {
   reason: string;
 }
 
-/** Structured skip-reason taxonomy (task 9). */
+export interface PageDebug {
+  url: string;
+  title: string | null;
+  h1: string | null;
+  name: string | null;
+  county: County;
+  dateMatches: string[];
+  contentPreview: string;
+  imageCandidates: string[];
+  reason: string;
+}
+
 export const SKIP_REASONS = [
   "404 page",
   "non-detail page",
@@ -74,7 +83,6 @@ export const SKIP_REASONS = [
   "duplicate",
   "suppressed",
   "unknown county",
-  "palm beach (not eligible for live import)",
 ] as const;
 export type SkipReason = (typeof SKIP_REASONS)[number];
 
@@ -84,20 +92,23 @@ export interface FriendImportSummary {
   skippedPages: SkippedPage[];
   detailUrlsDiscovered: number;
   detailPagesFetched: number;
-  recordsParsed: number; // detail pages that yielded a named record
-  validRecords: number; // parsed records that also have a date
+  namesFound: number;
+  datesFound: number;
+  validRecords: number;
   countyBreakdown: Record<County, number>;
   skipReasons: Record<SkipReason, number>;
+  mugshotUrlsDetected: number;
+  wouldInsert: number;
+  wouldUpdate: number;
   recordsInserted: number;
   recordsUpdated: number;
   recordsSuppressed: number;
   recordsSkipped: number;
-  eligibleForLiveImport: number; // valid Broward records
-  mugshotUrlsDetected: number;
+  eligibleForLiveImport: number;
   errors: string[];
   notes: string[];
-  sampleBroward: FriendRecord[];
-  samplePalmBeach: FriendRecord[];
+  sampleRecords: FriendRecord[];
+  debugPages: PageDebug[];
 }
 
 // ------------------------------------------------------------- config
@@ -124,7 +135,6 @@ function maxRecords(): number {
   return Number.isFinite(n) && n > 0 ? n : 100;
 }
 
-/** Cap on index/category pages crawled for link discovery. */
 const MAX_INDEX_PAGES = 30;
 
 function userAgent(): string {
@@ -192,29 +202,58 @@ function clean(text: string | null | undefined): string | null {
   return s === "" ? null : s;
 }
 
+const MONTHS: Record<string, string> = {
+  jan: "01", feb: "02", mar: "03", apr: "04", may: "05", jun: "06",
+  jul: "07", aug: "08", sep: "09", oct: "10", nov: "11", dec: "12",
+};
+
+/** Normalize many date shapes to ISO YYYY-MM-DD. Handles ISO, M/D/YYYY,
+ * M-D-YYYY, M/D/YY, M-D-YY, and "Month D, YYYY". */
 function toDate(value: string | null): string | null {
   const s = clean(value);
   if (!s) return null;
-  const iso = s.match(/(\d{4})-(\d{2})-(\d{2})/);
+
+  const iso = s.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
   if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
-  const us = s.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
-  if (us) return `${us[3]}-${us[1].padStart(2, "0")}-${us[2].padStart(2, "0")}`;
+
+  const numeric = s.match(/\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b/);
+  if (numeric) {
+    const mm = numeric[1].padStart(2, "0");
+    const dd = numeric[2].padStart(2, "0");
+    let yyyy = numeric[3];
+    if (yyyy.length === 2) yyyy = `20${yyyy}`;
+    if (Number(mm) >= 1 && Number(mm) <= 12 && Number(dd) >= 1 && Number(dd) <= 31) {
+      return `${yyyy}-${mm}-${dd}`;
+    }
+  }
+
   const named = s.match(
-    /(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+(\d{1,2}),?\s+(\d{4})/i
+    /\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+(\d{1,2}),?\s+(\d{4})\b/i
   );
   if (named) {
-    const d = new Date(`${named[1]} ${named[2]}, ${named[3]}`);
-    if (!Number.isNaN(d.getTime())) return d.toISOString().slice(0, 10);
+    const mm = MONTHS[named[1].slice(0, 3).toLowerCase()];
+    const dd = named[2].padStart(2, "0");
+    if (mm) return `${named[3]}-${mm}-${dd}`;
   }
   return null;
 }
 
+/** Every date-like substring in the text (for debug output). */
+function findDateLikeStrings(text: string): string[] {
+  const out = new Set<string>();
+  const patterns = [
+    /\b\d{4}-\d{2}-\d{2}\b/g,
+    /\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b/g,
+    /\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4}\b/gi,
+  ];
+  for (const re of patterns) {
+    for (const m of text.matchAll(re)) out.add(m[0]);
+  }
+  return Array.from(out).slice(0, 12);
+}
+
 function normalizeName(name: string): string {
-  return name
-    .toLowerCase()
-    .replace(/[^a-z0-9 ]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
+  return name.toLowerCase().replace(/[^a-z0-9 ]/g, "").replace(/\s+/g, " ").trim();
 }
 
 function splitName(full: string): { first: string | null; middle: string | null; last: string | null } {
@@ -240,22 +279,28 @@ function splitName(full: string): { first: string | null; middle: string | null;
 
 // ------------------------------------------------- county detection
 
-// Broward and Palm Beach cities/agencies. County is decided ONLY from
-// record-specific signals (explicit county field, arresting agency,
-// city/location, detail-page path) — never from whole-page text, because
-// the site's branding ("Palm Beach and Broward") appears on every page.
 const BROWARD_SIGNALS =
-  /\bbroward\b|\bbso\b|fort lauderdale|ft lauderdale|hollywood|pompano|coral springs|miramar|pembroke pines|sunrise|plantation|davie|deerfield|lauderhill|tamarac|weston|margate|coconut creek|oakland park|dania|hallandale|cooper city|parkland|wilton manors|lauderdale lakes|north lauderdale|coral gables/i;
+  /\bbroward\b|\bbso\b|fort lauderdale|ft lauderdale|hollywood|pompano|coral springs|miramar|pembroke pines|sunrise|plantation|davie|deerfield|lauderhill|tamarac|weston|margate|coconut creek|oakland park|dania|hallandale|cooper city|parkland|wilton manors|lauderdale lakes|north lauderdale/i;
 
 const PALM_BEACH_SIGNALS =
   /palm beach|\bpbso\b|\bpbc\b|west palm|boca raton|boynton|delray|jupiter|wellington|lake worth|riviera beach|royal palm|greenacres|belle glade|lantana|palm springs|loxahatchee|juno beach/i;
 
-function detectCounty(signalText: string): County {
-  const text = signalText.toLowerCase();
-  const broward = BROWARD_SIGNALS.test(text);
-  const palmBeach = PALM_BEACH_SIGNALS.test(text);
-  if (broward && !palmBeach) return "Broward";
-  if (palmBeach && !broward) return "Palm Beach";
+/**
+ * Score Broward vs Palm Beach across weighted, record-specific signals.
+ * Site-wide branding ("Palm Beach and Broward") contributes equally to
+ * both and cancels out, so per-record signals (county field, URL, title,
+ * category, city/agency) decide.
+ */
+function classifyCounty(signals: { text: string; weight: number }[]): County {
+  let broward = 0;
+  let palm = 0;
+  for (const { text, weight } of signals) {
+    if (!text) continue;
+    if (BROWARD_SIGNALS.test(text)) broward += weight;
+    if (PALM_BEACH_SIGNALS.test(text)) palm += weight;
+  }
+  if (broward > palm) return "Broward";
+  if (palm > broward) return "Palm Beach";
   return "Unknown";
 }
 
@@ -293,7 +338,6 @@ function labelValue($: cheerio.CheerioAPI, pageText: string, labels: string[]): 
 
 function parseCharges($: cheerio.CheerioAPI, pageText: string): Charge[] {
   const charges: Charge[] = [];
-
   $("h1, h2, h3, h4, strong, .label").each((_, el) => {
     if (charges.length > 0) return;
     const heading = clean($(el).text())?.toLowerCase() ?? "";
@@ -305,13 +349,11 @@ function parseCharges($: cheerio.CheerioAPI, pageText: string): Charge[] {
       });
       if (charges.length === 0) {
         const block = clean($(el).next().text());
-        if (block) {
-          block
-            .split(/;|•|\n/)
-            .map((s) => clean(s))
-            .filter((s): s is string => Boolean(s))
-            .forEach((desc) => charges.push({ description: desc }));
-        }
+        block
+          ?.split(/;|•|\n/)
+          .map((s) => clean(s))
+          .filter((s): s is string => Boolean(s))
+          .forEach((desc) => charges.push({ description: desc }));
       }
     }
   });
@@ -343,50 +385,137 @@ function parseCharges($: cheerio.CheerioAPI, pageText: string): Charge[] {
   return charges;
 }
 
+/** Collect every plausible image URL (task 9). Order = priority. */
+function collectImageCandidates($: cheerio.CheerioAPI, url: string): string[] {
+  const out: string[] = [];
+  const push = (raw: string | undefined | null) => {
+    if (!raw) return;
+    const first = raw.split(",")[0].trim().split(/\s+/)[0]; // handles srcset
+    if (!first) return;
+    try {
+      out.push(new URL(first, url).toString());
+    } catch {
+      /* ignore */
+    }
+  };
+
+  push($('meta[property="og:image"]').attr("content"));
+  push($('meta[property="og:image:url"]').attr("content"));
+  push($('meta[name="twitter:image"]').attr("content"));
+  push($('meta[name="twitter:image:src"]').attr("content"));
+  $("img.wp-post-image, .post-thumbnail img, figure.wp-block-post-featured-image img, .featured-image img").each(
+    (_, el) => {
+      push($(el).attr("src") || $(el).attr("data-src") || $(el).attr("data-lazy-src"));
+    }
+  );
+  $("img").each((_, el) => {
+    push($(el).attr("src"));
+    push($(el).attr("data-src"));
+    push($(el).attr("data-lazy-src"));
+    push($(el).attr("srcset") || $(el).attr("data-srcset"));
+  });
+  $("[style*='background-image']").each((_, el) => {
+    const style = $(el).attr("style") ?? "";
+    const m = style.match(/background-image\s*:\s*url\(['"]?([^'")]+)['"]?\)/i);
+    if (m) push(m[1]);
+  });
+
+  // De-dupe, keep uploads / real images, drop logos/icons/svg/placeholders.
+  const seen = new Set<string>();
+  const filtered: string[] = [];
+  for (const u of out) {
+    if (seen.has(u)) continue;
+    seen.add(u);
+    if (/\.svg(\?|$)/i.test(u)) continue;
+    if (/(logo|icon|favicon|placeholder|avatar|gravatar|spinner|blank)/i.test(u)) continue;
+    filtered.push(u);
+  }
+  return filtered;
+}
+
+function pickMugshot(candidates: string[]): string | null {
+  const upload = candidates.find((u) => /wp-content\/uploads/i.test(u));
+  if (upload) return upload;
+  const img = candidates.find((u) => /\.(jpe?g|png|webp)(\?|$)/i.test(u));
+  return img ?? candidates[0] ?? null;
+}
+
 interface ParseResult {
   record: FriendRecord | null;
   reason: SkipReason | null;
+  debug: PageDebug;
 }
 
 function parseDetail(html: string, url: string): ParseResult {
   const $ = cheerio.load(html);
-  $("script, style, nav, footer, header").remove();
-  const pageText = clean($("body").text()) ?? "";
 
-  let fullName =
-    clean($("h1").first().text()) ||
-    clean($('meta[property="og:title"]').attr("content")) ||
-    clean($("title").text());
-  if (fullName) {
-    fullName = fullName.replace(/\s*[|\-–].*$/, "").trim();
-  }
-  // A detail page for a person has a short name-like H1. Reject listing /
-  // category pages (long titles, "arrests", "mugshots").
-  if (!fullName || fullName.length < 3) return { record: null, reason: "missing name" };
-  if (/arrest|mugshot|booking|recent|category|results?/i.test(fullName) || fullName.split(/\s+/).length > 6) {
-    return { record: null, reason: "non-detail page" };
-  }
+  const title = clean($("title").text());
+  const h1 = clean($("h1").first().text());
+
+  // --- metadata captured BEFORE stripping scripts (JSON-LD) ---
+  const metaImageCandidates = collectImageCandidates($, url);
+  const metaPublished =
+    clean($('meta[property="article:published_time"]').attr("content")) ||
+    clean($('meta[property="og:updated_time"]').attr("content")) ||
+    clean($('meta[itemprop="datePublished"]').attr("content")) ||
+    clean($("time[datetime]").first().attr("datetime")) ||
+    clean($("time.entry-date, time.published").first().text());
 
   let sex: string | null = null;
+  let jsonLdName: string | null = null;
+  let jsonLdPublished: string | null = null;
   $('script[type="application/ld+json"]').each((_, el) => {
     try {
       const data = JSON.parse($(el).contents().text());
-      const nodes = Array.isArray(data) ? data : [data];
+      const nodes = Array.isArray(data) ? data : data["@graph"] ? data["@graph"] : [data];
       for (const node of nodes) {
-        if (node && typeof node === "object" && /person/i.test(String(node["@type"]))) {
-          if (node.name && !fullName) fullName = clean(String(node.name));
+        if (!node || typeof node !== "object") continue;
+        const type = String(node["@type"] ?? "").toLowerCase();
+        if (type.includes("person")) {
+          if (node.name) jsonLdName = clean(String(node.name));
           if (node.gender) sex = clean(String(node.gender));
         }
+        if (node.datePublished && !jsonLdPublished) jsonLdPublished = clean(String(node.datePublished));
+        if (node.dateCreated && !jsonLdPublished) jsonLdPublished = clean(String(node.dateCreated));
       }
     } catch {
       /* ignore malformed JSON-LD */
     }
   });
 
+  // --- name ---
+  let fullName = h1 || clean($('meta[property="og:title"]').attr("content")) || jsonLdName || title;
+  if (fullName) fullName = fullName.replace(/\s*[|\-–—].*$/, "").trim();
+  // Strip any trailing date/keywords that some titles append.
+  if (fullName) fullName = fullName.replace(/\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b/, "").trim();
+
+  const contentText = clean($("article, .entry-content, main, #content, body").first().text()) ?? "";
+  const debugBase: PageDebug = {
+    url,
+    title,
+    h1,
+    name: fullName,
+    county: "Unknown",
+    dateMatches: findDateLikeStrings(`${title ?? ""} ${contentText}`),
+    contentPreview: contentText.slice(0, 500),
+    imageCandidates: metaImageCandidates.slice(0, 8),
+    reason: "",
+  };
+
+  if (!fullName || fullName.length < 3) {
+    return { record: null, reason: "missing name", debug: { ...debugBase, reason: "missing name" } };
+  }
+  if (/recent arrests|mugshots|category|search results|page \d+/i.test(fullName) || fullName.split(/\s+/).length > 6) {
+    return { record: null, reason: "non-detail page", debug: { ...debugBase, reason: "non-detail page" } };
+  }
+
+  // Strip non-content for body text scanning.
+  $("script, style, nav, footer, header, aside").remove();
+  const pageText = clean($("body").text()) ?? "";
+
   const { first, middle, last } = splitName(fullName);
 
-  const ageRaw = labelValue($, pageText, ["Age"]);
-  const ageMatch = ageRaw?.match(/\d{1,3}/);
+  const ageMatch = labelValue($, pageText, ["Age"])?.match(/\d{1,3}/);
   const age = ageMatch ? Number(ageMatch[0]) : null;
 
   sex = sex || labelValue($, pageText, ["Sex", "Gender"]);
@@ -396,9 +525,7 @@ function parseDetail(html: string, url: string): ParseResult {
   }
 
   const charges = parseCharges($, pageText);
-  const chargesText = charges
-    .map((c) => [c.description, c.statute].filter(Boolean).join(" "))
-    .join("; ");
+  const chargesText = charges.map((c) => [c.description, c.statute].filter(Boolean).join(" ")).join("; ");
 
   const arrestNumber =
     labelValue($, pageText, [
@@ -406,35 +533,57 @@ function parseDetail(html: string, url: string): ParseResult {
       "Case Number", "Case #", "Jail Number", "Inmate Number", "Booking ID",
     ]) ?? null;
 
-  let mugshot = clean($('meta[property="og:image"]').attr("content"));
-  if (!mugshot) {
-    $("img").each((_, el) => {
-      if (mugshot) return;
-      const src = $(el).attr("src") || $(el).attr("data-src");
-      if (src && /(mugshot|booking|inmate|photo|upload|arrest)/i.test(src)) {
-        mugshot = src;
-      }
-    });
-  }
-  if (mugshot) {
-    try {
-      mugshot = new URL(mugshot, url).toString();
-    } catch {
-      mugshot = null;
-    }
+  // --- dates (task 5/6) ---
+  const bookingLabeled = toDate(labelValue($, pageText, ["Booking Date", "Booked", "Book Date", "Date Booked"]));
+  const arrestLabeled = toDate(labelValue($, pageText, ["Arrest Date", "Date Arrested", "Arrested On"]));
+  const releaseLabeled = toDate(labelValue($, pageText, ["Release Date", "Released", "Date Released"]));
+  const titleDate = toDate(title);
+  const wpPublished = toDate(metaPublished) || toDate(jsonLdPublished);
+  const bodyDate = toDate(findDateLikeStrings(pageText)[0] ?? null);
+
+  let bookingDate: string | null = null;
+  let dateSource: string | null = null;
+  if (bookingLabeled) {
+    bookingDate = bookingLabeled;
+    dateSource = "booking_label";
+  } else if (arrestLabeled) {
+    bookingDate = arrestLabeled;
+    dateSource = "arrest_label";
+  } else if (wpPublished) {
+    bookingDate = wpPublished;
+    dateSource = "imported_from_friend_site_date";
+  } else if (titleDate) {
+    bookingDate = titleDate;
+    dateSource = "imported_from_friend_site_date";
+  } else if (bodyDate) {
+    bookingDate = bodyDate;
+    dateSource = "imported_from_friend_site_date";
   }
 
-  const bond = labelValue($, pageText, ["Total Bond", "Bond", "Bail", "Bond Amount"]);
-  const bookingDate = toDate(labelValue($, pageText, ["Booking Date", "Booked", "Book Date", "Date Booked"]));
-  const arrestDate = toDate(labelValue($, pageText, ["Arrest Date", "Date Arrested"]));
-  const releaseDate = toDate(labelValue($, pageText, ["Release Date", "Released", "Date Released"]));
-  const location = labelValue($, pageText, ["Location", "Arrest Location", "City", "Agency", "Facility"]);
+  // --- county (task 7) ---
   const countyLabel = labelValue($, pageText, ["County"]);
   const agency = labelValue($, pageText, ["Arresting Agency", "Arrested By", "Agency", "Booking Agency"]);
+  const location = labelValue($, pageText, ["Location", "Arrest Location", "City", "Facility"]);
+  const categoryText = $('a[rel~="category"], .cat-links a, .post-categories a, .breadcrumb a')
+    .map((_, el) => $(el).text())
+    .get()
+    .join(" ");
+  const county = classifyCounty([
+    { text: countyLabel ?? "", weight: 100 },
+    { text: new URL(url).pathname.replace(/-/g, " "), weight: 12 },
+    { text: categoryText, weight: 10 },
+    { text: title ?? "", weight: 8 },
+    { text: [agency, location].filter(Boolean).join(" "), weight: 6 },
+    { text: pageText, weight: 1 },
+  ]);
 
-  const county = detectCounty(
-    [countyLabel, agency, location, new URL(url).pathname].filter(Boolean).join(" ")
-  );
+  // --- mugshot (task 9) ---
+  const imageCandidates = collectImageCandidates($, url).length
+    ? collectImageCandidates($, url)
+    : metaImageCandidates;
+  const mugshot = pickMugshot(imageCandidates);
+
+  const bond = labelValue($, pageText, ["Total Bond", "Bond", "Bail", "Bond Amount"]);
 
   const firstCharge = charges[0]?.description ?? "";
   const dedupBasis = arrestNumber
@@ -442,31 +591,38 @@ function parseDetail(html: string, url: string): ParseResult {
     : `nm:${normalizeName(fullName)}|bd:${bookingDate ?? ""}|ch:${normalizeName(firstCharge)}|u:${url}`;
   const dedupKey = createHash("sha1").update(dedupBasis).digest("hex");
 
-  return {
-    record: {
-      source: FRIEND_SOURCE,
-      county,
-      arrest_number: arrestNumber,
-      first_name: first,
-      middle_name: middle,
-      last_name: last,
-      full_name: fullName,
-      sex,
-      age: Number.isFinite(age) ? age : null,
-      booking_date: bookingDate,
-      arrest_date: arrestDate,
-      release_date: releaseDate,
-      location,
-      charges_json: charges,
-      charges_text: chargesText,
-      bond_json: bond ? { total_bond: bond } : null,
-      mugshot_url: mugshot ?? null,
-      official_detail_url: url,
-      status: "pending",
-      dedup_key: dedupKey,
-    },
-    reason: null,
+  const record: FriendRecord = {
+    source: FRIEND_SOURCE,
+    county,
+    arrest_number: arrestNumber,
+    first_name: first,
+    middle_name: middle,
+    last_name: last,
+    full_name: fullName,
+    sex,
+    age: Number.isFinite(age) ? age : null,
+    booking_date: bookingDate,
+    arrest_date: arrestLabeled,
+    release_date: releaseLabeled,
+    location,
+    charges_json: charges,
+    charges_text: chargesText,
+    bond_json: bond ? { total_bond: bond } : null,
+    mugshot_url: mugshot,
+    official_detail_url: url,
+    status: "pending",
+    date_source: dateSource,
+    dedup_key: dedupKey,
   };
+
+  const debug: PageDebug = {
+    ...debugBase,
+    name: fullName,
+    county,
+    imageCandidates: imageCandidates.slice(0, 8),
+    reason: bookingDate ? "ok" : "missing date",
+  };
+  return { record, reason: null, debug };
 }
 
 // -------------------------------------------------------- discovery
@@ -479,11 +635,11 @@ const INDEX_PATH_CANDIDATES = [
   "/broward",
   "/broward-county",
   "/broward-county-arrests",
+  "/palm-beach",
+  "/palm-beach-county-arrests",
   "/county/broward",
-  "/mugshots",
 ];
 
-// Category / index slugs (listing pages, not individual bookings).
 const CATEGORY_SLUG_PATTERN =
   /(arrests?|mugshots?|bookings?|records?|category|recent|county|charges?)$|-arrests?\b|-mugshots?\b/i;
 
@@ -513,12 +669,8 @@ function collectLinks($: cheerio.CheerioAPI, pageUrl: string, origin: string): C
     const segments = abs.pathname.split("/").filter(Boolean);
     if (segments.length === 0) return;
     const slug = segments[segments.length - 1];
-    if (CATEGORY_SLUG_PATTERN.test(slug)) {
-      category.add(abs.toString());
-    } else if (/[a-z]+-[a-z]+/i.test(slug)) {
-      // person-like slug (e.g. john-smith) — treat as a booking detail page
-      detail.add(abs.toString());
-    }
+    if (CATEGORY_SLUG_PATTERN.test(slug)) category.add(abs.toString());
+    else if (/[a-z]+-[a-z]+/i.test(slug)) detail.add(abs.toString());
   });
   return { detail: Array.from(detail), category: Array.from(category) };
 }
@@ -530,34 +682,35 @@ async function isSuppressed(record: FriendRecord): Promise<boolean> {
   if (!supabase) return false;
   const filters: string[] = [];
   if (record.arrest_number) filters.push(`arrest_number.eq.${record.arrest_number}`);
-  if (record.full_name && !record.full_name.includes(",")) {
-    filters.push(`full_name.ilike.${record.full_name}`);
-  }
+  if (record.full_name && !record.full_name.includes(",")) filters.push(`full_name.ilike.${record.full_name}`);
   if (filters.length === 0) return false;
-  const { data } = await supabase
-    .from("suppression_list")
-    .select("id")
-    .or(filters.join(","))
-    .limit(1);
+  const { data } = await supabase.from("suppression_list").select("id").or(filters.join(",")).limit(1);
   return Boolean(data && data.length > 0);
 }
 
-async function upsertRecord(
-  record: FriendRecord
-): Promise<"inserted" | "updated" | "suppressed" | "skipped"> {
+function synthArrestNumber(record: FriendRecord): string {
+  return record.arrest_number ?? `PBBM-${record.dedup_key.slice(0, 16)}`;
+}
+
+async function findExisting(record: FriendRecord) {
+  const supabase = getSupabase();
+  if (!supabase) return null;
+  const { data } = await supabase
+    .from("arrests")
+    .select("id, is_hidden, mugshot_hidden")
+    .eq("source", FRIEND_SOURCE)
+    .eq("arrest_number", synthArrestNumber(record))
+    .maybeSingle();
+  return data ?? null;
+}
+
+async function upsertRecord(record: FriendRecord): Promise<"inserted" | "updated" | "suppressed" | "skipped"> {
   const supabase = getSupabase();
   if (!supabase) return "skipped";
   if (await isSuppressed(record)) return "suppressed";
 
-  const arrestNumber = record.arrest_number ?? `PBBM-${record.dedup_key.slice(0, 16)}`;
-
-  const { data: existing } = await supabase
-    .from("arrests")
-    .select("id, is_hidden, mugshot_hidden")
-    .eq("source", FRIEND_SOURCE)
-    .eq("arrest_number", arrestNumber)
-    .maybeSingle();
-
+  const arrestNumber = synthArrestNumber(record);
+  const existing = await findExisting(record);
   const row = {
     source: FRIEND_SOURCE,
     county: record.county,
@@ -575,7 +728,7 @@ async function upsertRecord(
     charges_json: record.charges_json,
     charges_text: record.charges_text,
     bond_json: record.bond_json,
-    // Store the friend-site detail page URL in the existing column.
+    date_source: record.date_source,
     official_detail_url: record.official_detail_url,
     updated_at: new Date().toISOString(),
   };
@@ -584,29 +737,19 @@ async function upsertRecord(
     if (existing.is_hidden) return "suppressed";
     const { error } = await supabase
       .from("arrests")
-      .update({
-        ...row,
-        mugshot_url: existing.mugshot_hidden ? null : record.mugshot_url,
-      })
+      .update({ ...row, mugshot_url: existing.mugshot_hidden ? null : record.mugshot_url })
       .eq("id", existing.id);
     if (error) throw new Error(`Update failed for ${arrestNumber}: ${error.message}`);
     return "updated";
   }
-
-  const { error } = await supabase.from("arrests").insert({
-    ...row,
-    mugshot_url: record.mugshot_url,
-    status: "pending", // held for admin review, like manual import
-  });
+  const { error } = await supabase.from("arrests").insert({ ...row, mugshot_url: record.mugshot_url, status: "pending" });
   if (error) throw new Error(`Insert failed for ${arrestNumber}: ${error.message}`);
   return "inserted";
 }
 
 // ------------------------------------------------------------- runner
 
-export async function runFriendSiteImport(
-  options: FriendImportOptions
-): Promise<FriendImportSummary> {
+export async function runFriendSiteImport(options: FriendImportOptions): Promise<FriendImportSummary> {
   const log = options.log ?? ((line: string) => console.log(line));
   const supabase = getSupabase();
   const summary: FriendImportSummary = {
@@ -615,20 +758,23 @@ export async function runFriendSiteImport(
     skippedPages: [],
     detailUrlsDiscovered: 0,
     detailPagesFetched: 0,
-    recordsParsed: 0,
+    namesFound: 0,
+    datesFound: 0,
     validRecords: 0,
     countyBreakdown: { Broward: 0, "Palm Beach": 0, Unknown: 0 },
     skipReasons: Object.fromEntries(SKIP_REASONS.map((r) => [r, 0])) as Record<SkipReason, number>,
+    mugshotUrlsDetected: 0,
+    wouldInsert: 0,
+    wouldUpdate: 0,
     recordsInserted: 0,
     recordsUpdated: 0,
     recordsSuppressed: 0,
     recordsSkipped: 0,
     eligibleForLiveImport: 0,
-    mugshotUrlsDetected: 0,
     errors: [],
     notes: [],
-    sampleBroward: [],
-    samplePalmBeach: [],
+    sampleRecords: [],
+    debugPages: [],
   };
 
   if (!isAuthorized()) {
@@ -642,11 +788,7 @@ export async function runFriendSiteImport(
 
   let runId: string | null = null;
   if (!options.dryRun && supabase) {
-    const { data } = await supabase
-      .from("scraper_runs")
-      .insert({ source: FRIEND_SOURCE, status: "running" })
-      .select("id")
-      .single();
+    const { data } = await supabase.from("scraper_runs").insert({ source: FRIEND_SOURCE, status: "running" }).select("id").single();
     runId = data?.id ?? null;
   }
 
@@ -674,7 +816,6 @@ export async function runFriendSiteImport(
   const indexQueue: string[] = INDEX_PATH_CANDIDATES.map((p) => new URL(p, baseUrl()).toString());
   let blocked = false;
 
-  // --- Phase 1: crawl index/category pages, collecting detail links.
   while (indexQueue.length > 0 && crawledIndex.size < MAX_INDEX_PAGES) {
     const url = indexQueue.shift() as string;
     if (crawledIndex.has(url)) continue;
@@ -684,14 +825,12 @@ export async function runFriendSiteImport(
     await sleep(delayMs());
     log(`Checking source page: ${url}`);
     const res = await politeFetch(url);
-
     if (res.kind === "blocked") {
       summary.indexPagesChecked.push({ url, status: "blocked" });
       blocked = true;
       break;
     }
     if (res.kind === "notfound") {
-      // 404 category/index page — non-fatal skipped source page (task 1/2).
       summary.indexPagesChecked.push({ url, status: "404 (skipped)" });
       summary.skippedPages.push({ url, reason: "404 page" });
       summary.skipReasons["404 page"]++;
@@ -702,27 +841,22 @@ export async function runFriendSiteImport(
       summary.errors.push(res.detail);
       continue;
     }
-
     summary.indexPagesChecked.push({ url, status: "ok" });
     const { detail, category } = collectLinks(cheerio.load(res.body), url, origin);
     detail.forEach((u) => detailUrls.add(u));
     for (const c of category) {
-      if (!crawledIndex.has(c) && crawledIndex.size + indexQueue.length < MAX_INDEX_PAGES) {
-        indexQueue.push(c);
-      }
+      if (!crawledIndex.has(c) && crawledIndex.size + indexQueue.length < MAX_INDEX_PAGES) indexQueue.push(c);
     }
     log(`  found ${detail.length} detail link(s), ${category.length} category link(s)`);
   }
 
   summary.detailUrlsDiscovered = detailUrls.size;
-
   if (blocked && detailUrls.size === 0) {
     summary.errors.push("Friend site refused automated access (blocked). No bypass attempted.");
     log("BLOCKED: the friend site refused automated access. No bypass attempted.");
     return await finish("blocked");
   }
 
-  // --- Phase 2: fetch and parse detail pages (bounded by the record cap).
   const seen = new Set<string>();
   const records: FriendRecord[] = [];
 
@@ -730,7 +864,6 @@ export async function runFriendSiteImport(
     await sleep(delayMs());
     const res = await politeFetch(url);
     summary.detailPagesFetched++;
-
     if (res.kind === "blocked") {
       summary.errors.push(res.detail);
       log(`BLOCKED at ${url} — stopping detail fetches, no bypass attempted.`);
@@ -747,24 +880,27 @@ export async function runFriendSiteImport(
       continue;
     }
 
-    const { record, reason } = parseDetail(res.body, url);
+    const { record, reason, debug } = parseDetail(res.body, url);
     if (!record) {
       if (reason) summary.skipReasons[reason]++;
       continue;
     }
-    summary.recordsParsed++;
+    summary.namesFound++;
 
-    // Validity gate: an individual arrest record needs a date.
     if (!record.booking_date && !record.arrest_date) {
       summary.skipReasons["missing date"]++;
+      if (options.debug && summary.debugPages.length < 5) summary.debugPages.push(debug);
       continue;
     }
-    // In-run dedup.
+    summary.datesFound++;
+
     if (seen.has(record.dedup_key)) {
       summary.skipReasons["duplicate"]++;
       continue;
     }
     seen.add(record.dedup_key);
+
+    if (record.county === "Unknown") summary.skipReasons["unknown county"]++;
 
     summary.validRecords++;
     summary.countyBreakdown[record.county]++;
@@ -772,38 +908,45 @@ export async function runFriendSiteImport(
     records.push(record);
   }
 
-  summary.sampleBroward = records.filter((r) => r.county === "Broward").slice(0, 5);
-  summary.samplePalmBeach = records.filter((r) => r.county === "Palm Beach").slice(0, 5);
-  summary.eligibleForLiveImport = summary.countyBreakdown.Broward;
+  // Eligible = valid records with a known county (both Broward and Palm Beach).
+  const eligible = records.filter((r) => r.county !== "Unknown");
+  summary.eligibleForLiveImport = eligible.length;
+  summary.sampleRecords = records.slice(0, 5);
+
+  // Predict insert vs update for the dry-run preview.
+  if (isSupabaseConfigured()) {
+    for (const record of eligible) {
+      try {
+        const existing = await findExisting(record);
+        if (existing) summary.wouldUpdate++;
+        else summary.wouldInsert++;
+      } catch {
+        summary.wouldInsert++;
+      }
+    }
+  } else {
+    summary.wouldInsert = eligible.length;
+    summary.notes.push("Supabase not configured — insert/update split not previewed; showing all eligible as would-insert.");
+  }
 
   if (records.length === 0) {
     log("No valid records parsed from the friend site on this run.");
     return await finish(blocked ? "blocked" : "no_data");
   }
 
-  // --- Phase 3a: dry-run prints, writes nothing.
   if (options.dryRun) {
     log("");
     log(`DRY RUN — ${records.length} valid record(s). Nothing was written to the database.`);
-    log(
-      `County breakdown → Broward: ${summary.countyBreakdown.Broward}, Palm Beach: ${summary.countyBreakdown["Palm Beach"]}, Unknown: ${summary.countyBreakdown.Unknown}`
-    );
+    log(`County breakdown → Broward: ${summary.countyBreakdown.Broward}, Palm Beach: ${summary.countyBreakdown["Palm Beach"]}, Unknown: ${summary.countyBreakdown.Unknown}`);
     return await finish("dry_run");
   }
 
-  // --- Phase 3b: live import (Broward-only by default).
   if (!isSupabaseConfigured()) {
     summary.errors.push("Supabase is not configured; cannot write records. Use --dry-run or set env vars.");
     return await finish("error");
   }
   for (const record of records) {
-    if (record.county === "Palm Beach") {
-      summary.skipReasons["palm beach (not eligible for live import)"]++;
-      summary.recordsSkipped++;
-      continue;
-    }
     if (record.county === "Unknown") {
-      summary.skipReasons["unknown county"]++;
       summary.recordsSkipped++;
       continue;
     }
@@ -820,8 +963,6 @@ export async function runFriendSiteImport(
     }
   }
 
-  log(
-    `Done: valid ${summary.validRecords}, inserted ${summary.recordsInserted}, updated ${summary.recordsUpdated}, suppressed ${summary.recordsSuppressed}, skipped ${summary.recordsSkipped}, errors ${summary.errors.length}`
-  );
+  log(`Done: valid ${summary.validRecords}, inserted ${summary.recordsInserted}, updated ${summary.recordsUpdated}, suppressed ${summary.recordsSuppressed}, skipped ${summary.recordsSkipped}, errors ${summary.errors.length}`);
   return await finish(summary.errors.length > 0 ? "partial" : "success");
 }
