@@ -17,14 +17,15 @@ config({ path: path.resolve(process.cwd(), ".env") });
 
 import type { FriendRecord, PageDebug } from "../src/lib/importers/friend-site";
 
-function printSample(records: FriendRecord[]) {
+function printSample(label: string, records: FriendRecord[]) {
+  console.log(`  ${label} (${records.length}):`);
   if (records.length === 0) {
     console.log("      (none available)");
     return;
   }
   for (const r of records) {
     const date = r.booking_date || r.arrest_date || "unknown date";
-    console.log(`      • ${r.full_name} | ${r.county} | ${date} (${r.date_source ?? "no date source"})`);
+    console.log(`      • ${r.full_name} | ${r.county} (${r.county_source}) | ${date} (${r.date_source ?? "no date source"})`);
     console.log(`        charges: ${r.charges_text || "no charges parsed"}`);
     console.log(`        mugshot_url: ${r.mugshot_url ? `${r.mugshot_url} (stored only)` : "none detected"}`);
     console.log(`        official_detail_url: ${r.official_detail_url}`);
@@ -75,12 +76,13 @@ async function main() {
   console.log(`  dates found:            ${summary.datesFound}`);
   console.log(`  valid records:          ${summary.validRecords}`);
   console.log("");
-  console.log("  Counties detected (valid records):");
-  console.log(`      Broward valid records:      ${summary.countyBreakdown.Broward}`);
-  console.log(`      Palm Beach valid records:   ${summary.countyBreakdown["Palm Beach"]}`);
-  console.log(`      Unknown county:             ${summary.countyBreakdown.Unknown}`);
+  console.log("  Records by county (valid):");
+  console.log(`      Broward:      ${summary.countyBreakdown.Broward}`);
+  console.log(`      Palm Beach:   ${summary.countyBreakdown["Palm Beach"]}`);
+  console.log(`      Unknown:      ${summary.countyBreakdown.Unknown}`);
   console.log("");
-  console.log(`  mugshot URLs detected:  ${summary.mugshotUrlsDetected} (stored only; never downloaded, uploaded, or displayed)`);
+  console.log(`  clean mugshot URLs (after filtering): ${summary.mugshotUrlsDetected}`);
+  console.log(`  generic images skipped:               ${summary.genericImagesSkipped}`);
   console.log("");
   console.log("  Skip reasons:");
   for (const [reason, count] of Object.entries(summary.skipReasons)) {
@@ -96,8 +98,9 @@ async function main() {
   console.log(`      records suppressed: ${summary.recordsSuppressed}`);
   console.log(`      records skipped:    ${summary.recordsSkipped}`);
   console.log("");
-  console.log("  5 sample valid records:");
-  printSample(summary.sampleRecords);
+  console.log("  Sample records:");
+  printSample("Broward samples", summary.sampleBroward);
+  printSample("Palm Beach samples", summary.samplePalmBeach);
 
   if (summary.skippedPages.length > 0) {
     console.log("");

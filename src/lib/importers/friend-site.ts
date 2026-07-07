@@ -8,18 +8,14 @@ import { Charge, ScraperRunStatus } from "@/lib/types";
  * used with the site owner's explicit permission.
  *
  * The target is a WordPress site: booking records are posts, dates come
- * from post/published metadata when not labelled in the body, and photos
- * are WordPress featured images (wp-content/uploads). The parser is built
- * for those conventions.
+ * from post/published metadata when not labelled, photos are WordPress
+ * featured images (wp-content/uploads), and county is signalled by the
+ * category / breadcrumb / index page a post is discovered under.
  *
- * Safety model (unchanged):
- *  - Runs only when FRIEND_SITE_ALLOWED === "true" (authorization gate).
- *  - Honest UA, delay between requests, hard record cap.
- *  - Stops with status "blocked" on 401/403/429/503 or CAPTCHA/anti-bot
- *    pages — no bypassing, no proxies.
- *  - Dry-run writes nothing; suppression checked before every write.
- *  - Mugshot URLs are stored only — never downloaded, uploaded, or
- *    displayed (display gated separately by NEXT_PUBLIC_DISPLAY_MUGSHOTS).
+ * Safety model (unchanged): authorization gate (FRIEND_SITE_ALLOWED),
+ * honest UA, delay, hard cap, stop-on-block with no bypass or proxies,
+ * dry-run writes nothing, suppression checked before writes, mugshot URLs
+ * stored only (never downloaded, uploaded, or displayed).
  *
  * Both Broward and Palm Beach records are parsed and eligible for import.
  */
@@ -55,6 +51,7 @@ export interface FriendRecord {
   official_detail_url: string;
   status: "pending";
   date_source: string | null;
+  county_source: string | null;
   dedup_key: string;
 }
 
@@ -98,6 +95,7 @@ export interface FriendImportSummary {
   countyBreakdown: Record<County, number>;
   skipReasons: Record<SkipReason, number>;
   mugshotUrlsDetected: number;
+  genericImagesSkipped: number;
   wouldInsert: number;
   wouldUpdate: number;
   recordsInserted: number;
@@ -107,7 +105,8 @@ export interface FriendImportSummary {
   eligibleForLiveImport: number;
   errors: string[];
   notes: string[];
-  sampleRecords: FriendRecord[];
+  sampleBroward: FriendRecord[];
+  samplePalmBeach: FriendRecord[];
   debugPages: PageDebug[];
 }
 
@@ -116,34 +115,24 @@ export interface FriendImportSummary {
 function env(name: string, fallback: string): string {
   return process.env[name] || fallback;
 }
-
 function baseUrl(): string {
   return env("FRIEND_SITE_BASE_URL", "https://palmbeachandbrowardmugshots.com").replace(/\/+$/, "");
 }
-
 function isAuthorized(): boolean {
   return process.env.FRIEND_SITE_ALLOWED === "true";
 }
-
 function delayMs(): number {
   const n = Number(process.env.FRIEND_SITE_DELAY_MS);
   return Number.isFinite(n) && n >= 500 ? n : 3000;
 }
-
 function maxRecords(): number {
   const n = Number(process.env.FRIEND_SITE_MAX_RECORDS);
   return Number.isFinite(n) && n > 0 ? n : 100;
 }
-
 const MAX_INDEX_PAGES = 30;
-
 function userAgent(): string {
-  return env(
-    "FRIEND_SITE_USER_AGENT",
-    "Broward Arrest Resource MVP (authorized importer) - contact@example.com"
-  );
+  return env("FRIEND_SITE_USER_AGENT", "Broward Arrest Resource MVP (authorized importer) - contact@example.com");
 }
-
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -164,33 +153,21 @@ async function politeFetch(url: string): Promise<FetchOutcome> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 30_000);
     const res = await fetch(url, {
-      headers: {
-        "User-Agent": userAgent(),
-        Accept: "text/html,application/xhtml+xml",
-      },
+      headers: { "User-Agent": userAgent(), Accept: "text/html,application/xhtml+xml" },
       redirect: "follow",
       signal: controller.signal,
     });
     clearTimeout(timer);
-    if (res.status === 404 || res.status === 410) {
-      return { kind: "notfound", detail: `HTTP ${res.status} from ${url}` };
-    }
-    if ([401, 403, 429, 503].includes(res.status)) {
-      return { kind: "blocked", detail: `HTTP ${res.status} from ${url}` };
-    }
-    if (!res.ok) {
-      return { kind: "error", detail: `HTTP ${res.status} from ${url}` };
-    }
+    if (res.status === 404 || res.status === 410) return { kind: "notfound", detail: `HTTP ${res.status} from ${url}` };
+    if ([401, 403, 429, 503].includes(res.status)) return { kind: "blocked", detail: `HTTP ${res.status} from ${url}` };
+    if (!res.ok) return { kind: "error", detail: `HTTP ${res.status} from ${url}` };
     const body = await res.text();
     if (BLOCK_BODY_PATTERNS.test(body.slice(0, 20_000))) {
       return { kind: "blocked", detail: `Anti-bot / CAPTCHA challenge page from ${url}` };
     }
     return { kind: "ok", body };
   } catch (e) {
-    return {
-      kind: "error",
-      detail: `Fetch failed for ${url}: ${e instanceof Error ? e.message : String(e)}`,
-    };
+    return { kind: "error", detail: `Fetch failed for ${url}: ${e instanceof Error ? e.message : String(e)}` };
   }
 }
 
@@ -207,29 +184,20 @@ const MONTHS: Record<string, string> = {
   jul: "07", aug: "08", sep: "09", oct: "10", nov: "11", dec: "12",
 };
 
-/** Normalize many date shapes to ISO YYYY-MM-DD. Handles ISO, M/D/YYYY,
- * M-D-YYYY, M/D/YY, M-D-YY, and "Month D, YYYY". */
 function toDate(value: string | null): string | null {
   const s = clean(value);
   if (!s) return null;
-
   const iso = s.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
   if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
-
   const numeric = s.match(/\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b/);
   if (numeric) {
     const mm = numeric[1].padStart(2, "0");
     const dd = numeric[2].padStart(2, "0");
     let yyyy = numeric[3];
     if (yyyy.length === 2) yyyy = `20${yyyy}`;
-    if (Number(mm) >= 1 && Number(mm) <= 12 && Number(dd) >= 1 && Number(dd) <= 31) {
-      return `${yyyy}-${mm}-${dd}`;
-    }
+    if (Number(mm) >= 1 && Number(mm) <= 12 && Number(dd) >= 1 && Number(dd) <= 31) return `${yyyy}-${mm}-${dd}`;
   }
-
-  const named = s.match(
-    /\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+(\d{1,2}),?\s+(\d{4})\b/i
-  );
+  const named = s.match(/\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+(\d{1,2}),?\s+(\d{4})\b/i);
   if (named) {
     const mm = MONTHS[named[1].slice(0, 3).toLowerCase()];
     const dd = named[2].padStart(2, "0");
@@ -238,7 +206,6 @@ function toDate(value: string | null): string | null {
   return null;
 }
 
-/** Every date-like substring in the text (for debug output). */
 function findDateLikeStrings(text: string): string[] {
   const out = new Set<string>();
   const patterns = [
@@ -246,9 +213,7 @@ function findDateLikeStrings(text: string): string[] {
     /\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b/g,
     /\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4}\b/gi,
   ];
-  for (const re of patterns) {
-    for (const m of text.matchAll(re)) out.add(m[0]);
-  }
+  for (const re of patterns) for (const m of text.matchAll(re)) out.add(m[0]);
   return Array.from(out).slice(0, 12);
 }
 
@@ -261,20 +226,12 @@ function splitName(full: string): { first: string | null; middle: string | null;
   if (cleaned.includes(",")) {
     const [lastPart, rest] = cleaned.split(",");
     const restParts = clean(rest)?.split(/\s+/) ?? [];
-    return {
-      last: clean(lastPart),
-      first: restParts[0] ?? null,
-      middle: restParts.slice(1).join(" ") || null,
-    };
+    return { last: clean(lastPart), first: restParts[0] ?? null, middle: restParts.slice(1).join(" ") || null };
   }
   const parts = cleaned.split(/\s+/).filter(Boolean);
   if (parts.length === 0) return { first: null, middle: null, last: null };
   if (parts.length === 1) return { first: parts[0], middle: null, last: null };
-  return {
-    first: parts[0],
-    last: parts[parts.length - 1],
-    middle: parts.slice(1, -1).join(" ") || null,
-  };
+  return { first: parts[0], last: parts[parts.length - 1], middle: parts.slice(1, -1).join(" ") || null };
 }
 
 // ------------------------------------------------- county detection
@@ -285,12 +242,14 @@ const BROWARD_SIGNALS =
 const PALM_BEACH_SIGNALS =
   /palm beach|\bpbso\b|\bpbc\b|west palm|boca raton|boynton|delray|jupiter|wellington|lake worth|riviera beach|royal palm|greenacres|belle glade|lantana|palm springs|loxahatchee|juno beach/i;
 
-/**
- * Score Broward vs Palm Beach across weighted, record-specific signals.
- * Site-wide branding ("Palm Beach and Broward") contributes equally to
- * both and cancels out, so per-record signals (county field, URL, title,
- * category, city/agency) decide.
- */
+/** County hint from an index/detail URL path (task 1). */
+function pathCountyHint(path: string): County {
+  const p = path.toLowerCase();
+  if (/palm[-_ ]?beach/.test(p)) return "Palm Beach";
+  if (/broward/.test(p)) return "Broward";
+  return "Unknown";
+}
+
 function classifyCounty(signals: { text: string; weight: number }[]): County {
   let broward = 0;
   let palm = 0;
@@ -302,6 +261,93 @@ function classifyCounty(signals: { text: string; weight: number }[]): County {
   if (broward > palm) return "Broward";
   if (palm > broward) return "Palm Beach";
   return "Unknown";
+}
+
+// ---------------------------------------------------- content cleanup
+
+// Selectors for non-content chrome removed before extracting charges/text.
+const CHROME_SELECTORS =
+  "script, style, nav, footer, header, aside, form, .widget, .widgets, .widget-area, #secondary, .sidebar, .site-footer, .site-header, .footer, .menu, .nav-menu, .navigation, .main-navigation, .breadcrumb, .breadcrumbs, .cat-links, .post-categories, .sharedaddy, .jp-relatedposts, .related-posts, .comments-area, .entry-footer";
+
+// Boilerplate / navigation phrases that must never be treated as charges.
+const CHARGE_BOILERPLATE =
+  /browse arrests by charge|palm beach and broward mugshots|report a tip|public safety resources|meet the publisher|recent (posts|arrests)|related|leave a (comment|reply)|share this|categories|read more|continue reading|newsletter|subscribe|advertisement|all rights reserved|©|view all|see more|home\b|contact/i;
+
+const CHARGE_KEYWORDS =
+  /possess|batter|assault|dui|driving|theft|burglar|traffic|robbery|fraud|forgery|resist|domestic|weapon|firearm|drug|cocaine|cannabis|marijuana|trespass|homicide|murder|violation|probation|contempt|disorderly|solicit|larceny|grand|petit|controlled|paraphernalia|dwls|battery|stalking|kidnap|fleeing|eluding|obstruct/i;
+
+// "DUI Arrests", "Battery Arrests", etc. — charge-category menu labels.
+const CATEGORY_LABEL = /^(.*)\barrests?$/i;
+
+function isValidCharge(line: string): boolean {
+  const s = line.trim();
+  if (s.length < 4 || s.length > 200) return false;
+  if (CHARGE_BOILERPLATE.test(s)) return false;
+  if (/^\W+$/.test(s)) return false;
+  if (CATEGORY_LABEL.test(s) && s.split(/\s+/).length <= 4) return false; // "DUI Arrests"
+  const hasStatute = /\d{3}\.\d{2,3}/.test(s) || /\bf\.?\s?s\.?\b/i.test(s);
+  const hasKeyword = CHARGE_KEYWORDS.test(s);
+  return hasStatute || hasKeyword || s.split(/\s+/).length >= 3;
+}
+
+// ---------------------------------------------------- image handling
+
+const GENERIC_IMAGE =
+  /cropped-image|cropped-|logo|banner|header|favicon|site-icon|placeholder|avatar|gravatar|spinner|loading|default|blank|sprite|wp-emoji|icon[-_.]/i;
+
+interface GatheredImages {
+  kept: string[]; // ordered, best first
+  genericCount: number;
+}
+
+function gatherImages($: cheerio.CheerioAPI, $content: cheerio.Cheerio<never>, url: string): GatheredImages {
+  const scored: { url: string; priority: number }[] = [];
+  const push = (raw: string | undefined | null, priority: number) => {
+    if (!raw) return;
+    const first = raw.split(",")[0].trim().split(/\s+/)[0];
+    if (!first) return;
+    try {
+      scored.push({ url: new URL(first, url).toString(), priority });
+    } catch {
+      /* ignore */
+    }
+  };
+
+  // Featured / content images (nearest to the record) rank highest.
+  $content.find("img").each((_, el) => {
+    const isFeatured = /wp-post-image|attachment-|size-/i.test($(el).attr("class") ?? "");
+    push($(el).attr("src"), isFeatured ? 1 : 3);
+    push($(el).attr("data-src"), isFeatured ? 1 : 3);
+    push($(el).attr("data-lazy-src"), isFeatured ? 1 : 3);
+    push($(el).attr("srcset") || $(el).attr("data-srcset"), 4);
+  });
+  $("img.wp-post-image, .post-thumbnail img, figure.wp-block-post-featured-image img, .featured-image img").each((_, el) => {
+    push($(el).attr("src") || $(el).attr("data-src") || $(el).attr("data-lazy-src"), 1);
+  });
+  // Social meta (usually the featured image on WP posts).
+  push($('meta[property="og:image"]').attr("content"), 2);
+  push($('meta[name="twitter:image"]').attr("content"), 2);
+  $content.find("[style*='background-image']").each((_, el) => {
+    const m = ($(el).attr("style") ?? "").match(/background-image\s*:\s*url\(['"]?([^'")]+)['"]?\)/i);
+    if (m) push(m[1], 5);
+  });
+
+  const seen = new Set<string>();
+  const kept: { url: string; priority: number }[] = [];
+  let genericCount = 0;
+  for (const c of scored) {
+    if (seen.has(c.url)) continue;
+    seen.add(c.url);
+    if (/\.svg(\?|$)/i.test(c.url) || GENERIC_IMAGE.test(c.url)) {
+      genericCount++;
+      continue;
+    }
+    // Prefer things that look like uploaded photos.
+    const isPhoto = /wp-content\/uploads/i.test(c.url) || /\.(jpe?g|png|webp)(\?|$)/i.test(c.url);
+    kept.push({ url: c.url, priority: isPhoto ? c.priority : c.priority + 5 });
+  }
+  kept.sort((a, b) => a.priority - b.priority);
+  return { kept: kept.map((k) => k.url), genericCount };
 }
 
 // ---------------------------------------------------- detail parsing
@@ -322,11 +368,7 @@ function labelValue($: cheerio.CheerioAPI, pageText: string, labels: string[]): 
       }
     });
     if (found) return found;
-
-    const re = new RegExp(
-      `${label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*[:#-]?\\s*([^\\n|]{1,120})`,
-      "i"
-    );
+    const re = new RegExp(`${label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*[:#-]?\\s*([^\\n|]{1,120})`, "i");
     const m = pageText.match(re);
     if (m) {
       const val = clean(m[1]);
@@ -336,109 +378,68 @@ function labelValue($: cheerio.CheerioAPI, pageText: string, labels: string[]): 
   return null;
 }
 
-function parseCharges($: cheerio.CheerioAPI, pageText: string): Charge[] {
-  const charges: Charge[] = [];
-  $("h1, h2, h3, h4, strong, .label").each((_, el) => {
-    if (charges.length > 0) return;
+function parseCharges($: cheerio.CheerioAPI, $content: cheerio.Cheerio<never>, contentText: string): Charge[] {
+  const raw: string[] = [];
+
+  // 1. A "Charges" heading inside content → following list or block.
+  $content.find("h1, h2, h3, h4, strong").each((_, el) => {
+    if (raw.length > 0) return;
     const heading = clean($(el).text())?.toLowerCase() ?? "";
     if (/^charges?\b/.test(heading)) {
       const list = $(el).nextAll("ul, ol").first();
       list.find("li").each((_, li) => {
-        const desc = clean($(li).text());
-        if (desc) charges.push({ description: desc });
+        const d = clean($(li).text());
+        if (d) raw.push(d);
       });
-      if (charges.length === 0) {
-        const block = clean($(el).next().text());
-        block
+      if (raw.length === 0) {
+        clean($(el).next().text())
           ?.split(/;|•|\n/)
           .map((s) => clean(s))
           .filter((s): s is string => Boolean(s))
-          .forEach((desc) => charges.push({ description: desc }));
+          .forEach((d) => raw.push(d));
       }
     }
   });
-  if (charges.length > 0) return charges;
 
-  $("table tr").each((_, tr) => {
-    const cells = $(tr)
-      .find("td")
-      .map((_, td) => clean($(td).text()))
-      .get()
-      .filter(Boolean) as string[];
-    if (cells.length >= 1 && /charge|statute|offense|\d{3}\.\d{2}/i.test(cells.join(" "))) {
-      const desc = cells[0];
-      if (desc && !/^charge|^statute|^offense/i.test(desc)) {
-        charges.push({ description: desc, statute: cells[1] ?? null, bond_amount: cells[2] ?? null });
-      }
-    }
-  });
-  if (charges.length > 0) return charges;
-
-  const m = pageText.match(/charges?\s*[:#-]?\s*([^\n]{3,240})/i);
-  if (m) {
-    clean(m[1])
+  // 2. Labelled "Charges: a; b; c".
+  if (raw.length === 0) {
+    const val = labelValue($, contentText, ["Charges", "Charge", "Offense", "Offenses"]);
+    val
       ?.split(/;|•/)
       .map((s) => clean(s))
       .filter((s): s is string => Boolean(s))
-      .forEach((desc) => charges.push({ description: desc }));
+      .forEach((d) => raw.push(d));
+  }
+
+  // 3. Lines in content that carry a statute pattern.
+  if (raw.length === 0) {
+    for (const line of contentText.split(/[;\n]/)) {
+      if (/\d{3}\.\d{2,3}/.test(line)) {
+        const d = clean(line);
+        if (d) raw.push(d);
+      }
+    }
+  }
+
+  const seen = new Set<string>();
+  const charges: Charge[] = [];
+  for (const line of raw) {
+    if (!isValidCharge(line)) continue;
+    const key = normalizeName(line);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const statute = line.match(/\d{3}\.\d{2,3}[a-z0-9().]*/i)?.[0] ?? null;
+    charges.push({ description: line, statute });
+    if (charges.length >= 15) break;
   }
   return charges;
 }
 
-/** Collect every plausible image URL (task 9). Order = priority. */
-function collectImageCandidates($: cheerio.CheerioAPI, url: string): string[] {
-  const out: string[] = [];
-  const push = (raw: string | undefined | null) => {
-    if (!raw) return;
-    const first = raw.split(",")[0].trim().split(/\s+/)[0]; // handles srcset
-    if (!first) return;
-    try {
-      out.push(new URL(first, url).toString());
-    } catch {
-      /* ignore */
-    }
-  };
+const NON_RECORD_SLUG =
+  /report-a-tip|public-safety-resources|meet-the-publisher|about|contact|privacy|terms|disclaimer|advertise|publisher|resources|story|news|category|tag|author|page|home/i;
 
-  push($('meta[property="og:image"]').attr("content"));
-  push($('meta[property="og:image:url"]').attr("content"));
-  push($('meta[name="twitter:image"]').attr("content"));
-  push($('meta[name="twitter:image:src"]').attr("content"));
-  $("img.wp-post-image, .post-thumbnail img, figure.wp-block-post-featured-image img, .featured-image img").each(
-    (_, el) => {
-      push($(el).attr("src") || $(el).attr("data-src") || $(el).attr("data-lazy-src"));
-    }
-  );
-  $("img").each((_, el) => {
-    push($(el).attr("src"));
-    push($(el).attr("data-src"));
-    push($(el).attr("data-lazy-src"));
-    push($(el).attr("srcset") || $(el).attr("data-srcset"));
-  });
-  $("[style*='background-image']").each((_, el) => {
-    const style = $(el).attr("style") ?? "";
-    const m = style.match(/background-image\s*:\s*url\(['"]?([^'")]+)['"]?\)/i);
-    if (m) push(m[1]);
-  });
-
-  // De-dupe, keep uploads / real images, drop logos/icons/svg/placeholders.
-  const seen = new Set<string>();
-  const filtered: string[] = [];
-  for (const u of out) {
-    if (seen.has(u)) continue;
-    seen.add(u);
-    if (/\.svg(\?|$)/i.test(u)) continue;
-    if (/(logo|icon|favicon|placeholder|avatar|gravatar|spinner|blank)/i.test(u)) continue;
-    filtered.push(u);
-  }
-  return filtered;
-}
-
-function pickMugshot(candidates: string[]): string | null {
-  const upload = candidates.find((u) => /wp-content\/uploads/i.test(u));
-  if (upload) return upload;
-  const img = candidates.find((u) => /\.(jpe?g|png|webp)(\?|$)/i.test(u));
-  return img ?? candidates[0] ?? null;
-}
+const NON_RECORD_TITLE =
+  /report a tip|public safety resources|meet the publisher|about us|contact|privacy|terms|disclaimer|advertise|resources|home page|archive/i;
 
 interface ParseResult {
   record: FriendRecord | null;
@@ -446,20 +447,23 @@ interface ParseResult {
   debug: PageDebug;
 }
 
-function parseDetail(html: string, url: string): ParseResult {
+function parseDetail(html: string, url: string, countyHint: County): ParseResult {
   const $ = cheerio.load(html);
-
   const title = clean($("title").text());
   const h1 = clean($("h1").first().text());
 
-  // --- metadata captured BEFORE stripping scripts (JSON-LD) ---
-  const metaImageCandidates = collectImageCandidates($, url);
+  // Metadata captured before stripping scripts/chrome.
   const metaPublished =
     clean($('meta[property="article:published_time"]').attr("content")) ||
     clean($('meta[property="og:updated_time"]').attr("content")) ||
     clean($('meta[itemprop="datePublished"]').attr("content")) ||
     clean($("time[datetime]").first().attr("datetime")) ||
     clean($("time.entry-date, time.published").first().text());
+
+  const breadcrumbText = $(".breadcrumb, .breadcrumbs, [class*='breadcrumb'], .cat-links a, .post-categories a, a[rel~='category']")
+    .map((_, el) => $(el).text())
+    .get()
+    .join(" ");
 
   let sex: string | null = null;
   let jsonLdName: string | null = null;
@@ -475,21 +479,32 @@ function parseDetail(html: string, url: string): ParseResult {
           if (node.name) jsonLdName = clean(String(node.name));
           if (node.gender) sex = clean(String(node.gender));
         }
-        if (node.datePublished && !jsonLdPublished) jsonLdPublished = clean(String(node.datePublished));
-        if (node.dateCreated && !jsonLdPublished) jsonLdPublished = clean(String(node.dateCreated));
+        if ((node.datePublished || node.dateCreated) && !jsonLdPublished) {
+          jsonLdPublished = clean(String(node.datePublished ?? node.dateCreated));
+        }
       }
     } catch {
-      /* ignore malformed JSON-LD */
+      /* ignore */
     }
   });
 
-  // --- name ---
   let fullName = h1 || clean($('meta[property="og:title"]').attr("content")) || jsonLdName || title;
   if (fullName) fullName = fullName.replace(/\s*[|\-–—].*$/, "").trim();
-  // Strip any trailing date/keywords that some titles append.
   if (fullName) fullName = fullName.replace(/\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b/, "").trim();
 
-  const contentText = clean($("article, .entry-content, main, #content, body").first().text()) ?? "";
+  const slug = new URL(url).pathname.split("/").filter(Boolean).pop() ?? "";
+
+  // Strip chrome, then work within the post content only.
+  $(CHROME_SELECTORS).remove();
+  const $content = ($(".entry-content").first().length
+    ? $(".entry-content").first()
+    : $("article").first().length
+      ? $("article").first()
+      : $("main").first().length
+        ? $("main").first()
+        : $("body")) as unknown as cheerio.Cheerio<never>;
+  const contentText = clean($content.text()) ?? "";
+
   const debugBase: PageDebug = {
     url,
     title,
@@ -498,92 +513,91 @@ function parseDetail(html: string, url: string): ParseResult {
     county: "Unknown",
     dateMatches: findDateLikeStrings(`${title ?? ""} ${contentText}`),
     contentPreview: contentText.slice(0, 500),
-    imageCandidates: metaImageCandidates.slice(0, 8),
+    imageCandidates: [],
     reason: "",
   };
 
   if (!fullName || fullName.length < 3) {
     return { record: null, reason: "missing name", debug: { ...debugBase, reason: "missing name" } };
   }
-  if (/recent arrests|mugshots|category|search results|page \d+/i.test(fullName) || fullName.split(/\s+/).length > 6) {
-    return { record: null, reason: "non-detail page", debug: { ...debugBase, reason: "non-detail page" } };
+  // Non-record pages (task 2): resource/news/about pages, or an over-long
+  // "name" that is really a headline.
+  if (NON_RECORD_SLUG.test(slug) || (title && NON_RECORD_TITLE.test(title)) || fullName.split(/\s+/).length > 5) {
+    return { record: null, reason: "non-detail page", debug: { ...debugBase, reason: "non-detail page (resource/news/about)" } };
   }
 
-  // Strip non-content for body text scanning.
-  $("script, style, nav, footer, header, aside").remove();
-  const pageText = clean($("body").text()) ?? "";
-
   const { first, middle, last } = splitName(fullName);
-
-  const ageMatch = labelValue($, pageText, ["Age"])?.match(/\d{1,3}/);
+  const ageMatch = labelValue($, contentText, ["Age"])?.match(/\d{1,3}/);
   const age = ageMatch ? Number(ageMatch[0]) : null;
 
-  sex = sex || labelValue($, pageText, ["Sex", "Gender"]);
+  sex = sex || labelValue($, contentText, ["Sex", "Gender"]);
   if (sex) {
     const s = sex.trim().toUpperCase();
     sex = s.startsWith("M") ? "M" : s.startsWith("F") ? "F" : sex;
   }
 
-  const charges = parseCharges($, pageText);
+  const charges = parseCharges($, $content, contentText);
   const chargesText = charges.map((c) => [c.description, c.statute].filter(Boolean).join(" ")).join("; ");
-
   const arrestNumber =
-    labelValue($, pageText, [
+    labelValue($, contentText, [
       "Booking Number", "Booking #", "Booking No", "Arrest Number", "Arrest #",
       "Case Number", "Case #", "Jail Number", "Inmate Number", "Booking ID",
     ]) ?? null;
 
-  // --- dates (task 5/6) ---
-  const bookingLabeled = toDate(labelValue($, pageText, ["Booking Date", "Booked", "Book Date", "Date Booked"]));
-  const arrestLabeled = toDate(labelValue($, pageText, ["Arrest Date", "Date Arrested", "Arrested On"]));
-  const releaseLabeled = toDate(labelValue($, pageText, ["Release Date", "Released", "Date Released"]));
+  // Task 2: require arrest/booking-style content, not just a name.
+  const hasArrestSignal =
+    charges.length > 0 ||
+    Boolean(arrestNumber) ||
+    age !== null ||
+    /\b(charge|charges|booking|booked|arrest|bond|bail|jail|custody|inmate|mugshot)\b/i.test(contentText.slice(0, 4000));
+  if (!hasArrestSignal) {
+    return { record: null, reason: "non-detail page", debug: { ...debugBase, reason: "non-detail page (no arrest/booking content)" } };
+  }
+
+  // Dates.
+  const bookingLabeled = toDate(labelValue($, contentText, ["Booking Date", "Booked", "Book Date", "Date Booked"]));
+  const arrestLabeled = toDate(labelValue($, contentText, ["Arrest Date", "Date Arrested", "Arrested On"]));
+  const releaseLabeled = toDate(labelValue($, contentText, ["Release Date", "Released", "Date Released"]));
   const titleDate = toDate(title);
   const wpPublished = toDate(metaPublished) || toDate(jsonLdPublished);
-  const bodyDate = toDate(findDateLikeStrings(pageText)[0] ?? null);
+  const bodyDate = toDate(findDateLikeStrings(contentText)[0] ?? null);
 
   let bookingDate: string | null = null;
   let dateSource: string | null = null;
-  if (bookingLabeled) {
-    bookingDate = bookingLabeled;
-    dateSource = "booking_label";
-  } else if (arrestLabeled) {
-    bookingDate = arrestLabeled;
-    dateSource = "arrest_label";
-  } else if (wpPublished) {
-    bookingDate = wpPublished;
-    dateSource = "imported_from_friend_site_date";
-  } else if (titleDate) {
-    bookingDate = titleDate;
-    dateSource = "imported_from_friend_site_date";
-  } else if (bodyDate) {
-    bookingDate = bodyDate;
-    dateSource = "imported_from_friend_site_date";
+  if (bookingLabeled) [bookingDate, dateSource] = [bookingLabeled, "booking_label"];
+  else if (arrestLabeled) [bookingDate, dateSource] = [arrestLabeled, "arrest_label"];
+  else if (wpPublished) [bookingDate, dateSource] = [wpPublished, "imported_from_friend_site_date"];
+  else if (titleDate) [bookingDate, dateSource] = [titleDate, "imported_from_friend_site_date"];
+  else if (bodyDate) [bookingDate, dateSource] = [bodyDate, "imported_from_friend_site_date"];
+
+  // County: detail-specific signals first, else the index-page hint (task 1).
+  const countyLabel = labelValue($, contentText, ["County"]);
+  const agency = labelValue($, contentText, ["Arresting Agency", "Arrested By", "Agency", "Booking Agency"]);
+  const location = labelValue($, contentText, ["Location", "Arrest Location", "City", "Facility"]);
+  const detailCounty = classifyCounty([
+    { text: countyLabel ?? "", weight: 100 },
+    { text: breadcrumbText, weight: 25 },
+    { text: new URL(url).pathname.replace(/-/g, " "), weight: 20 },
+    { text: title ?? "", weight: 12 },
+    { text: [agency, location].filter(Boolean).join(" "), weight: 10 },
+    { text: contentText, weight: 2 },
+  ]);
+  let county: County;
+  let countySource: string;
+  if (detailCounty !== "Unknown") {
+    county = detailCounty;
+    countySource = "detail_page";
+  } else if (countyHint !== "Unknown") {
+    county = countyHint;
+    countySource = "index_page_hint";
+  } else {
+    county = "Unknown";
+    countySource = "undetermined";
   }
 
-  // --- county (task 7) ---
-  const countyLabel = labelValue($, pageText, ["County"]);
-  const agency = labelValue($, pageText, ["Arresting Agency", "Arrested By", "Agency", "Booking Agency"]);
-  const location = labelValue($, pageText, ["Location", "Arrest Location", "City", "Facility"]);
-  const categoryText = $('a[rel~="category"], .cat-links a, .post-categories a, .breadcrumb a')
-    .map((_, el) => $(el).text())
-    .get()
-    .join(" ");
-  const county = classifyCounty([
-    { text: countyLabel ?? "", weight: 100 },
-    { text: new URL(url).pathname.replace(/-/g, " "), weight: 12 },
-    { text: categoryText, weight: 10 },
-    { text: title ?? "", weight: 8 },
-    { text: [agency, location].filter(Boolean).join(" "), weight: 6 },
-    { text: pageText, weight: 1 },
-  ]);
-
-  // --- mugshot (task 9) ---
-  const imageCandidates = collectImageCandidates($, url).length
-    ? collectImageCandidates($, url)
-    : metaImageCandidates;
-  const mugshot = pickMugshot(imageCandidates);
-
-  const bond = labelValue($, pageText, ["Total Bond", "Bond", "Bail", "Bond Amount"]);
+  const { kept: imageKept, genericCount } = gatherImages($, $content, url);
+  const mugshot = imageKept[0] ?? null;
+  const bond = labelValue($, contentText, ["Total Bond", "Bond", "Bail", "Bond Amount"]);
 
   const firstCharge = charges[0]?.description ?? "";
   const dedupBasis = arrestNumber
@@ -612,6 +626,7 @@ function parseDetail(html: string, url: string): ParseResult {
     official_detail_url: url,
     status: "pending",
     date_source: dateSource,
+    county_source: countySource,
     dedup_key: dedupKey,
   };
 
@@ -619,9 +634,11 @@ function parseDetail(html: string, url: string): ParseResult {
     ...debugBase,
     name: fullName,
     county,
-    imageCandidates: imageCandidates.slice(0, 8),
+    imageCandidates: imageKept.slice(0, 8),
     reason: bookingDate ? "ok" : "missing date",
   };
+  // Carry the per-page generic-image count via a private field for the runner.
+  (record as FriendRecord & { _genericImages?: number })._genericImages = genericCount;
   return { record, reason: null, debug };
 }
 
@@ -629,22 +646,23 @@ function parseDetail(html: string, url: string): ParseResult {
 
 const INDEX_PATH_CANDIDATES = [
   "/",
-  "/recent-arrests",
-  "/recent",
-  "/arrests",
   "/broward",
   "/broward-county",
   "/broward-county-arrests",
-  "/palm-beach",
-  "/palm-beach-county-arrests",
+  "/broward-county-mugshots",
   "/county/broward",
+  "/palm-beach",
+  "/palm-beach-county",
+  "/palm-beach-county-arrests",
+  "/palm-beach-county-mugshots",
+  "/recent-arrests",
 ];
 
 const CATEGORY_SLUG_PATTERN =
-  /(arrests?|mugshots?|bookings?|records?|category|recent|county|charges?)$|-arrests?\b|-mugshots?\b/i;
+  /(arrests?|mugshots?|bookings?|records?|category|recent|county|charges?)$|-arrests?\b|-mugshots?\b|broward|palm-beach/i;
 
 const NON_DETAIL_PATTERN =
-  /\/(page|category|tag|author|wp-|feed|search|contact|about|privacy|terms|login|remove|sitemap)/i;
+  /\/(page|category|tag|author|wp-|feed|search|contact|about|privacy|terms|login|remove|sitemap|report-a-tip|resources|publisher)/i;
 
 interface ClassifiedLinks {
   detail: string[];
@@ -687,11 +705,9 @@ async function isSuppressed(record: FriendRecord): Promise<boolean> {
   const { data } = await supabase.from("suppression_list").select("id").or(filters.join(",")).limit(1);
   return Boolean(data && data.length > 0);
 }
-
 function synthArrestNumber(record: FriendRecord): string {
   return record.arrest_number ?? `PBBM-${record.dedup_key.slice(0, 16)}`;
 }
-
 async function findExisting(record: FriendRecord) {
   const supabase = getSupabase();
   if (!supabase) return null;
@@ -703,12 +719,10 @@ async function findExisting(record: FriendRecord) {
     .maybeSingle();
   return data ?? null;
 }
-
 async function upsertRecord(record: FriendRecord): Promise<"inserted" | "updated" | "suppressed" | "skipped"> {
   const supabase = getSupabase();
   if (!supabase) return "skipped";
   if (await isSuppressed(record)) return "suppressed";
-
   const arrestNumber = synthArrestNumber(record);
   const existing = await findExisting(record);
   const row = {
@@ -732,7 +746,6 @@ async function upsertRecord(record: FriendRecord): Promise<"inserted" | "updated
     official_detail_url: record.official_detail_url,
     updated_at: new Date().toISOString(),
   };
-
   if (existing) {
     if (existing.is_hidden) return "suppressed";
     const { error } = await supabase
@@ -764,6 +777,7 @@ export async function runFriendSiteImport(options: FriendImportOptions): Promise
     countyBreakdown: { Broward: 0, "Palm Beach": 0, Unknown: 0 },
     skipReasons: Object.fromEntries(SKIP_REASONS.map((r) => [r, 0])) as Record<SkipReason, number>,
     mugshotUrlsDetected: 0,
+    genericImagesSkipped: 0,
     wouldInsert: 0,
     wouldUpdate: 0,
     recordsInserted: 0,
@@ -773,7 +787,8 @@ export async function runFriendSiteImport(options: FriendImportOptions): Promise
     eligibleForLiveImport: 0,
     errors: [],
     notes: [],
-    sampleRecords: [],
+    sampleBroward: [],
+    samplePalmBeach: [],
     debugPages: [],
   };
 
@@ -811,7 +826,7 @@ export async function runFriendSiteImport(options: FriendImportOptions): Promise
   };
 
   const origin = new URL(baseUrl()).origin;
-  const detailUrls = new Set<string>();
+  const detailUrls = new Map<string, County>(); // url -> county hint from discovering page
   const crawledIndex = new Set<string>();
   const indexQueue: string[] = INDEX_PATH_CANDIDATES.map((p) => new URL(p, baseUrl()).toString());
   let blocked = false;
@@ -842,12 +857,16 @@ export async function runFriendSiteImport(options: FriendImportOptions): Promise
       continue;
     }
     summary.indexPagesChecked.push({ url, status: "ok" });
+    const hint = pathCountyHint(new URL(url).pathname);
     const { detail, category } = collectLinks(cheerio.load(res.body), url, origin);
-    detail.forEach((u) => detailUrls.add(u));
+    for (const d of detail) {
+      const prev = detailUrls.get(d);
+      if (prev === undefined || (prev === "Unknown" && hint !== "Unknown")) detailUrls.set(d, hint);
+    }
     for (const c of category) {
       if (!crawledIndex.has(c) && crawledIndex.size + indexQueue.length < MAX_INDEX_PAGES) indexQueue.push(c);
     }
-    log(`  found ${detail.length} detail link(s), ${category.length} category link(s)`);
+    log(`  found ${detail.length} detail link(s) [hint: ${hint}], ${category.length} category link(s)`);
   }
 
   summary.detailUrlsDiscovered = detailUrls.size;
@@ -860,7 +879,7 @@ export async function runFriendSiteImport(options: FriendImportOptions): Promise
   const seen = new Set<string>();
   const records: FriendRecord[] = [];
 
-  for (const url of Array.from(detailUrls).slice(0, maxRecords())) {
+  for (const [url, hint] of Array.from(detailUrls).slice(0, maxRecords())) {
     await sleep(delayMs());
     const res = await politeFetch(url);
     summary.detailPagesFetched++;
@@ -880,11 +899,12 @@ export async function runFriendSiteImport(options: FriendImportOptions): Promise
       continue;
     }
 
-    const { record, reason, debug } = parseDetail(res.body, url);
+    const { record, reason, debug } = parseDetail(res.body, url, hint);
     if (!record) {
       if (reason) summary.skipReasons[reason]++;
       continue;
     }
+    summary.genericImagesSkipped += (record as FriendRecord & { _genericImages?: number })._genericImages ?? 0;
     summary.namesFound++;
 
     if (!record.booking_date && !record.arrest_date) {
@@ -901,24 +921,21 @@ export async function runFriendSiteImport(options: FriendImportOptions): Promise
     seen.add(record.dedup_key);
 
     if (record.county === "Unknown") summary.skipReasons["unknown county"]++;
-
     summary.validRecords++;
     summary.countyBreakdown[record.county]++;
     if (record.mugshot_url) summary.mugshotUrlsDetected++;
     records.push(record);
   }
 
-  // Eligible = valid records with a known county (both Broward and Palm Beach).
   const eligible = records.filter((r) => r.county !== "Unknown");
   summary.eligibleForLiveImport = eligible.length;
-  summary.sampleRecords = records.slice(0, 5);
+  summary.sampleBroward = records.filter((r) => r.county === "Broward").slice(0, 5);
+  summary.samplePalmBeach = records.filter((r) => r.county === "Palm Beach").slice(0, 5);
 
-  // Predict insert vs update for the dry-run preview.
   if (isSupabaseConfigured()) {
     for (const record of eligible) {
       try {
-        const existing = await findExisting(record);
-        if (existing) summary.wouldUpdate++;
+        if (await findExisting(record)) summary.wouldUpdate++;
         else summary.wouldInsert++;
       } catch {
         summary.wouldInsert++;
