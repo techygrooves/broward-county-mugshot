@@ -12,7 +12,9 @@
     "start": "next start -H 0.0.0.0 -p 3000",
     "lint": "next lint",
     "scrape:broward": "tsx scripts/scrape-broward.ts",
-    "scrape:broward:dry-run": "tsx scripts/scrape-broward.ts --dry-run"
+    "scrape:broward:dry-run": "tsx scripts/scrape-broward.ts --dry-run",
+    "import:friend-site": "tsx scripts/import-friend-site.ts",
+    "import:friend-site:dry-run": "tsx scripts/import-friend-site.ts --dry-run"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",
