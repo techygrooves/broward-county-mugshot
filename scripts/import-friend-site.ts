@@ -26,7 +26,7 @@ function printSample(label: string, records: FriendRecord[]) {
   for (const r of records) {
     const date = r.booking_date || r.arrest_date || "unknown date";
     console.log(`      • ${r.full_name} | ${r.county} (${r.county_source}) | ${date} (${r.date_source ?? "no date source"})`);
-    console.log(`        charges: ${r.charges_text || "no charges parsed"}`);
+    console.log(`        charges: ${r.charges_text || `(none — ${r.charges_note ?? "charges_not_parsed"})`}`);
     console.log(`        mugshot_url: ${r.mugshot_url ? `${r.mugshot_url} (stored only)` : "none detected"}`);
     console.log(`        official_detail_url: ${r.official_detail_url}`);
   }
@@ -80,6 +80,10 @@ async function main() {
   console.log(`      Broward:      ${summary.countyBreakdown.Broward}`);
   console.log(`      Palm Beach:   ${summary.countyBreakdown["Palm Beach"]}`);
   console.log(`      Unknown:      ${summary.countyBreakdown.Unknown}`);
+  console.log("");
+  console.log("  Broward charge parsing:");
+  console.log(`      with parsed charges:    ${summary.browardWithCharges}`);
+  console.log(`      without parsed charges: ${summary.browardWithoutCharges} (kept valid, charges_not_parsed)`);
   console.log("");
   console.log(`  clean mugshot URLs (after filtering): ${summary.mugshotUrlsDetected}`);
   console.log(`  generic images skipped:               ${summary.genericImagesSkipped}`);

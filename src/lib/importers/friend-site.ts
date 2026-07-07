@@ -52,6 +52,7 @@ export interface FriendRecord {
   status: "pending";
   date_source: string | null;
   county_source: string | null;
+  charges_note: string | null; // "charges_not_parsed" when no charges extracted
   dedup_key: string;
 }
 
@@ -96,6 +97,8 @@ export interface FriendImportSummary {
   skipReasons: Record<SkipReason, number>;
   mugshotUrlsDetected: number;
   genericImagesSkipped: number;
+  browardWithCharges: number;
+  browardWithoutCharges: number;
   wouldInsert: number;
   wouldUpdate: number;
   recordsInserted: number;
@@ -378,8 +381,33 @@ function labelValue($: cheerio.CheerioAPI, pageText: string, labels: string[]): 
   return null;
 }
 
+// Phrases that introduce charges in narrative post bodies. Capture runs to
+// end of line; the sentence is trimmed afterwards (so a decimal inside a
+// statute like 784.03 does not truncate the charge).
+const CHARGE_PHRASES = [
+  /charged with(?: the following(?: charges?)?)?:?\s*([^\n]{3,220})/i,
+  /(?:was|were) arrested (?:for|on)(?: charges? of)?:?\s*([^\n]{3,220})/i,
+  /face[sd]? (?:a )?charges? of:?\s*([^\n]{3,220})/i,
+  /booked (?:on|for|into)(?: charges? of)?:?\s*([^\n]{3,220})/i,
+  /charges? include[sd]?:?\s*([^\n]{3,220})/i,
+];
+
+/** Trim a captured run at the first real sentence break (". " — not a
+ * decimal like 784.03) so charges don't bleed into following prose. */
+function firstSentence(value: string): string {
+  const cut = value.search(/\.\s|\.$/);
+  return cut > 0 ? value.slice(0, cut) : value;
+}
+
+function splitChargeList(value: string): string[] {
+  return firstSentence(value)
+    .split(/;|•|\n|,| and (?=[A-Z0-9])/)
+    .map((s) => clean(s))
+    .filter((s): s is string => Boolean(s));
+}
+
 function parseCharges($: cheerio.CheerioAPI, $content: cheerio.Cheerio<never>, contentText: string): Charge[] {
-  const raw: string[] = [];
+  let raw: string[] = [];
 
   // 1. A "Charges" heading inside content → following list or block.
   $content.find("h1, h2, h3, h4, strong").each((_, el) => {
@@ -404,20 +432,44 @@ function parseCharges($: cheerio.CheerioAPI, $content: cheerio.Cheerio<never>, c
   // 2. Labelled "Charges: a; b; c".
   if (raw.length === 0) {
     const val = labelValue($, contentText, ["Charges", "Charge", "Offense", "Offenses"]);
-    val
-      ?.split(/;|•/)
-      .map((s) => clean(s))
-      .filter((s): s is string => Boolean(s))
-      .forEach((d) => raw.push(d));
+    if (val) raw = splitChargeList(val);
   }
 
-  // 3. Lines in content that carry a statute pattern.
+  // 3. Narrative phrasing: "charged with ...", "arrested for ...", etc.
   if (raw.length === 0) {
-    for (const line of contentText.split(/[;\n]/)) {
-      if (/\d{3}\.\d{2,3}/.test(line)) {
-        const d = clean(line);
+    for (const re of CHARGE_PHRASES) {
+      const m = contentText.match(re);
+      if (m) {
+        raw = splitChargeList(m[1]);
+        if (raw.length > 0) break;
+      }
+    }
+  }
+
+  // 4. Lines/list items in content that carry a statute pattern.
+  if (raw.length === 0) {
+    $content.find("li, p, td").each((_, el) => {
+      const t = clean($(el).text());
+      if (t && /\d{3}\.\d{2,3}/.test(t)) raw.push(t);
+    });
+    if (raw.length === 0) {
+      for (const line of contentText.split(/[;\n]/)) {
+        if (/\d{3}\.\d{2,3}/.test(line)) {
+          const d = clean(line);
+          if (d) raw.push(d);
+        }
+      }
+    }
+  }
+
+  // 5. Fallback: content sentences that carry a charge keyword.
+  if (raw.length === 0) {
+    for (const seg of contentText.split(/[.;\n]/)) {
+      if (CHARGE_KEYWORDS.test(seg)) {
+        const d = clean(seg);
         if (d) raw.push(d);
       }
+      if (raw.length >= 20) break;
     }
   }
 
@@ -428,7 +480,7 @@ function parseCharges($: cheerio.CheerioAPI, $content: cheerio.Cheerio<never>, c
     const key = normalizeName(line);
     if (seen.has(key)) continue;
     seen.add(key);
-    const statute = line.match(/\d{3}\.\d{2,3}[a-z0-9().]*/i)?.[0] ?? null;
+    const statute = line.match(/\d{3}\.\d{2,3}(?:\([a-z0-9]\))*/i)?.[0] ?? null;
     charges.push({ description: line, statute });
     if (charges.length >= 15) break;
   }
@@ -627,6 +679,7 @@ function parseDetail(html: string, url: string, countyHint: County): ParseResult
     status: "pending",
     date_source: dateSource,
     county_source: countySource,
+    charges_note: charges.length === 0 ? "charges_not_parsed" : null,
     dedup_key: dedupKey,
   };
 
@@ -743,6 +796,7 @@ async function upsertRecord(record: FriendRecord): Promise<"inserted" | "updated
     charges_text: record.charges_text,
     bond_json: record.bond_json,
     date_source: record.date_source,
+    charges_note: record.charges_note,
     official_detail_url: record.official_detail_url,
     updated_at: new Date().toISOString(),
   };
@@ -778,6 +832,8 @@ export async function runFriendSiteImport(options: FriendImportOptions): Promise
     skipReasons: Object.fromEntries(SKIP_REASONS.map((r) => [r, 0])) as Record<SkipReason, number>,
     mugshotUrlsDetected: 0,
     genericImagesSkipped: 0,
+    browardWithCharges: 0,
+    browardWithoutCharges: 0,
     wouldInsert: 0,
     wouldUpdate: 0,
     recordsInserted: 0,
@@ -929,7 +985,10 @@ export async function runFriendSiteImport(options: FriendImportOptions): Promise
 
   const eligible = records.filter((r) => r.county !== "Unknown");
   summary.eligibleForLiveImport = eligible.length;
-  summary.sampleBroward = records.filter((r) => r.county === "Broward").slice(0, 5);
+  const browardRecords = records.filter((r) => r.county === "Broward");
+  summary.browardWithCharges = browardRecords.filter((r) => r.charges_json.length > 0).length;
+  summary.browardWithoutCharges = browardRecords.filter((r) => r.charges_json.length === 0).length;
+  summary.sampleBroward = browardRecords.slice(0, 5);
   summary.samplePalmBeach = records.filter((r) => r.county === "Palm Beach").slice(0, 5);
 
   if (isSupabaseConfigured()) {
