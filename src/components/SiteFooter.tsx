@@ -18,8 +18,10 @@ export default function SiteFooter() {
           <div>
             <p className="text-sm font-semibold text-slate-800">Explore</p>
             <ul className="mt-2 space-y-1.5 text-sm text-slate-600">
-              <li><Link className="hover:text-brand-700" href="/recent-arrests">Recent Broward Arrest Records</Link></li>
-              <li><Link className="hover:text-brand-700" href="/search">Broward County Arrest Search</Link></li>
+              <li><Link className="hover:text-brand-700" href="/recent-arrests">Recent Arrest Records</Link></li>
+              <li><Link className="hover:text-brand-700" href="/county/broward">Broward County Arrests</Link></li>
+              <li><Link className="hover:text-brand-700" href="/county/palm-beach">Palm Beach County Arrests</Link></li>
+              <li><Link className="hover:text-brand-700" href="/search">Arrest Search</Link></li>
               <li><Link className="hover:text-brand-700" href="/charges">Browse by Charge</Link></li>
               <li><Link className="hover:text-brand-700" href="/guides">Legal Information Guides</Link></li>
               <li><Link className="hover:text-brand-700" href="/remove-mugshot">Free Removal Request</Link></li>
