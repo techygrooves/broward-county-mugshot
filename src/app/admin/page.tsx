@@ -31,8 +31,44 @@ export default async function AdminDashboardPage() {
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <StatCard label="Total records" value={stats.totalRecords} href="/admin/records" />
         <StatCard label="Hidden records" value={stats.hiddenRecords} href="/admin/records?filter=hidden" />
-        <StatCard label="Pending (unpublished) records" value={stats.pendingRecords} href="/admin/records?filter=pending" />
+        <StatCard label="Pending (status) records" value={stats.pendingRecords} href="/admin/records?filter=pending" />
         <StatCard label="Pending removal requests" value={stats.pendingRemovals} href="/admin/removal-requests" />
+      </div>
+
+      <div className="mt-6 rounded-lg border border-slate-200 bg-white p-5 shadow-sm">
+        <h2 className="font-serif text-base font-bold text-brand-900">
+          Debug counts
+        </h2>
+        <p className="mt-1 text-xs text-slate-500">
+          Public visibility = not hidden (is_hidden false/null) and not removed
+          (removed_at null). Records are shown on the site regardless of
+          <code className="mx-1 rounded bg-slate-100 px-1">status</code>.
+        </p>
+        <dl className="mt-4 grid grid-cols-2 gap-4 sm:grid-cols-5">
+          {[
+            { label: "Total arrests", value: stats.totalRecords },
+            { label: "Visible arrests", value: stats.visibleRecords },
+            { label: "Broward", value: stats.browardRecords },
+            { label: "Palm Beach", value: stats.palmBeachRecords },
+            { label: "With mugshot_url", value: stats.withMugshotRecords },
+          ].map((item) => (
+            <div key={item.label} className="rounded-md bg-slate-50 p-3">
+              <p className="text-2xl font-bold text-brand-900">{item.value}</p>
+              <p className="mt-0.5 text-xs text-slate-500">{item.label}</p>
+            </div>
+          ))}
+        </dl>
+        <div className="mt-4 flex flex-wrap gap-3 text-sm">
+          <Link href="/county/broward" className="text-brand-700 hover:underline">
+            View Broward page →
+          </Link>
+          <Link href="/county/palm-beach" className="text-brand-700 hover:underline">
+            View Palm Beach page →
+          </Link>
+          <Link href="/recent-arrests" className="text-brand-700 hover:underline">
+            View recent arrests →
+          </Link>
+        </div>
       </div>
 
       <div className="mt-8 rounded-lg border border-slate-200 bg-white p-5 shadow-sm">
